@@ -1,9 +1,14 @@
 import csv
 
 import numpy as np
+import torch
 from scipy import fft
 
 from matplotlib import pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import f1_score
 
 
 def concat_csvs(file_pathes, result_path):
@@ -17,8 +22,8 @@ def concat_csvs(file_pathes, result_path):
                     output_file.write(line)
 
 
-def load_data(file_path):
-    l2c = list()  # label to class mark
+def load_data(file_path, label2class=None):
+    l2c = label2class or list()  # label to class mark
     features, labels = list(), list()
     with open(file_path) as input_file:
         reader = csv.reader(input_file, delimiter=',')
@@ -29,6 +34,13 @@ def load_data(file_path):
                 l2c.append(row[0])
             labels.append(l2c.index(row[0]))
     return np.array(features), np.array(labels)
+
+
+def johnson_transform(data, data_len_factor=0.75):
+    result = list()
+    for i in range(int(len(data) * data_len_factor)):
+        result.append(sum(abs(data[j + i] - data[j]) for j in range(len(data) - i)) / (len(data) - i))
+    return np.array(result)
 
 
 def divide_windows(features, labels, window_size, step_factor):
@@ -63,6 +75,24 @@ def fourier_windows(features, labels, freq_ignore_factor=0.0):
     return np.array(new_features), np.array(new_labels)
 
 
+def johnson_windows(features, labels):
+    new_features, new_labels = list(), list()
+    for i in range(features.shape[0]):
+        row = [johnson_transform(features[i, j, :]) for j in range(features.shape[1])]
+        new_features.append(row)
+        new_labels.append(labels[i])
+    return np.array(new_features), np.array(new_labels)
+
+
+def differential_windows(features, labels):
+    new_features, new_labels = list(), list()
+    for i in range(features.shape[0]):
+        row = [(np.roll(features[i, j, :], 1) - np.roll(features[i, j, :], -1))[1:-1] / 2 for j in range(features.shape[1])]
+        new_features.append(row)
+        new_labels.append(labels[i])
+    return np.array(new_features), np.array(new_labels)
+
+
 def concat_by_channels(features, labels):
     return features.reshape(features.shape[0], features.shape[1] * features.shape[2]), labels
 
@@ -88,46 +118,90 @@ def plot_windows(features, labels, only=None):
     figure.subplots_adjust(hspace=0)
     plt.show()
 
-# def extract_features_fourier(raw_features, labels, window_size=128, step_factor=0.5):
-#     step = int(window_size * step_factor)
-#     new_features, new_labels = list(), list()
-#     for i in range(0, raw_features.shape[0] - window_size, step):
-#         if len(set(labels[i:i + window_size])) != 1:
-#             continue
-#         channel_ffts = list()
-#         for j in range(raw_features.shape[1]):
-#             window = raw_features[i:i + window_size, j]
-#             win_mean = window.mean()
-#             channel_ffts.extend([np.log1p(abs(x)) for x in fft(window - win_mean)[:window_size // 2]])
-#         new_features.append(channel_ffts)
-#         new_labels.append(labels[i])
-#     return np.array(new_features), np.array(new_labels)
+
+def pipeline(classifier, stages, train_data_file_path, test_data_file_path, data_type='array', label2class=None, features_processors=None, features_selectors=None):
+    features, labels = load_data(train_data_file_path, label2class)
+
+    for stage in stages:
+        features, labels = stage[0](features, labels, **stage[1])
+
+    features_train, features_val, labels_train, labels_val = train_test_split(features, labels, test_size=0.15)
+
+    if features_processors:
+        for processor in features_processors:
+            processor.fit(features_train)
+            features_train = processor.transform(features_train)
+            features_val = processor.transform(features_val)
+            print(f'Train features shape after {processor}: {features_train.shape}')
+
+    if features_selectors:
+        for selector in features_selectors:
+            selector.fit(features_train, labels_train)
+            features_train = selector.transform(features_train)
+            features_val = selector.transform(features_val)
+            print(f'Train features shape after {selector}: {features_train.shape}')
+
+    if data_type == 'tensor':
+        features_train, labels_train = torch.tensor(features_train, dtype=torch.float32), torch.tensor(labels_train, dtype=torch.long)
+        features_val, labels_val = torch.tensor(features_val, dtype=torch.float32), torch.tensor(labels_val, dtype=torch.long)
+        classifier.fit(features_train, labels_train)
+
+    print('Train score:', f1_score(classifier.predict(features_train), labels_train, average='weighted'))
+    print('Validation score:', f1_score(classifier.predict(features_val), labels_val, average='weighted'))
+
+    features_test, labels_test = load_data(test_data_file_path, label2class)
+
+    for stage in stages:
+        features_test, labels_test = stage[0](features_test, labels_test, **stage[1])
+
+    if features_processors:
+        for processor in features_processors:
+            features_test = processor.transform(features_test)
+
+    if features_selectors:
+        for selector in features_selectors:
+            features_test = selector.transform(features_test)
+
+    if data_type == 'tensor':
+        features_test, labels_test = torch.tensor(features_test, dtype=torch.float32), torch.tensor(labels_test, dtype=torch.long)
+    print('Test score:', f1_score(classifier.predict(features_test), labels_test, average='weighted'))
 
 
 if __name__ == '__main__':
-    test_features = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
-    test_labels = [1, 1, 2, 2]
-    windows, labels = divide_windows(test_features, test_labels, 2, 1.0)
-    print(windows, labels)
-    print()
-    avg, labels = avg_windows(windows, [1, 1], 2, 1)
-    print(avg, labels)
-    print()
-    fourier, labels = fourier_windows(avg, labels)
-    print(fourier, labels)
-    print()
-    channels, labels = concat_by_channels(windows, [1, 2])
-    print(channels, labels)
+    # test_features = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
+    # test_labels = [1, 1, 2, 2]
+    # windows, labels = divide_windows(test_features, test_labels, 2, 1.0)
+    # print(windows, labels)
+    # print()
+    # avg, labels = avg_windows(windows, [1, 1], 2, 1)
+    # print(avg, labels)
+    # print()
+    # fourier, labels = fourier_windows(avg, labels)
+    # print(fourier, labels)
+    # print()
+    # channels, labels = concat_by_channels(windows, [1, 2])
+    # print(channels, labels)
+    #
+    # sine = np.array([np.sin(10 * np.linspace(-10, 10, 500))]).T
+    # f, l = divide_windows(sine, [1] * len(sine), window_size=50, step_factor=1.0)
+    # f, l = fourier_windows(f, l)
+    # plot_windows(f[:, 0, :])
+    #
+    # noisy_sine = np.array([np.sin(10 * np.linspace(-1000, 1000, 10000)) + np.random.normal(0, 1, 10000)]).T
+    # f, l = divide_windows(noisy_sine, [1] * len(noisy_sine), window_size=50, step_factor=1.0)
+    # f_avg, l_avg = avg_windows(f, l, n_windows=20, step_windows=20)
+    # f_f, l_f = fourier_windows(f, l)
+    # f_af, l_af = fourier_windows(f_avg, l_avg)
+    # plot_windows(f_f[:, 0, :])
+    # plot_windows(f_af[:, 0, :])
 
-    sine = np.array([np.sin(10 * np.linspace(-10, 10, 500))]).T
-    f, l = divide_windows(sine, [1] * len(sine), window_size=50, step_factor=1.0)
-    f, l = fourier_windows(f, l)
-    plot_windows(f[:, 0, :])
+    # x = np.linspace(0, 100, 200)
+    # sine = np.sin(x)
+    # jt = johnson_transform(sine)
+    # plt.plot(x, sine)
+    # plt.plot(jt)
+    # jt_diff = (np.roll(jt, 1) - np.roll(jt, -1))[1:-1] / 2
+    # plt.plot(jt_diff)
+    # plt.show()
 
-    noisy_sine = np.array([np.sin(10 * np.linspace(-1000, 1000, 10000)) + np.random.normal(0, 1, 10000)]).T
-    f, l = divide_windows(noisy_sine, [1] * len(noisy_sine), window_size=50, step_factor=1.0)
-    f_avg, l_avg = avg_windows(f, l, n_windows=20, step_windows=20)
-    f_f, l_f = fourier_windows(f, l)
-    f_af, l_af = fourier_windows(f_avg, l_avg)
-    plot_windows(f_f[:, 0, :])
-    plot_windows(f_af[:, 0, :])
+    pass
